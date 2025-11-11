@@ -14,3 +14,5 @@ camera
 2：Andrid HAL 是怎么调用 V4L2的，V4L2是怎么调用AIS的?
 3：调用Android的接口打开camera,ais V4L2 给的是编码的视频数据还是raw 视频数据？
 4: select/poll/epoll/mmap/copy_to_user/copy_from_user/
+5:![Uploading DVR (1).png…]()
+
