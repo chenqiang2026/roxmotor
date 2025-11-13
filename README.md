@@ -16,5 +16,5 @@ camera
 4: select/poll/epoll/mmap/copy_to_user/copy_from_user/
 5:![Uploading DVR (1).png…]()
 6: 高通8155 的AVM 4个环视camera接在ADC上面，高通8295的AVM 4个环视接在IVI上面,处理 AVM矫正,拼接的算法和接口需要从ADC 移到  CDC上面
- CDC上面是QNX 处理 AVM的视频流 还是Android 处理呢？ QNX的启动时间比Android 慢18-20S左右。
+ CDC上面是QNX 处理 AVM的视频流 还是Android 处理呢？ QNX的启动时间比Android 快18-20S左右。
 
