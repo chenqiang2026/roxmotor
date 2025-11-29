@@ -1,0 +1,693 @@
+#include "UpgradeProcess.h"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <iterator>
+#include <random>
+#include <sys/stat.h>
+#include <iostream>
+#include <sys/types.h>
+#include <thread> 
+#include <chrono> 
+#include <fcntl.h> 
+#include <sys/poll.h>
+#include <type_traits>
+#include <unistd.h> 
+#include <string>
+#include <fstream>
+#include <iostream>
+#include <cstring>
+
+using namespace std;
+struct i2cDriverInfo;
+constexpr const char* LOG_TAG = "UpgradeProcess";
+//ivi i2c设备节点
+constexpr const char* iviI2cDevPath = "/dev/i2c2";
+constexpr const uint32_t iviI2cAddr = 0x30;
+//cluster i2c设备节点
+constexpr const char* clusterI2cDevPath = "/dev/i2c7";
+//constexpr const uint32_t clusterI2cAddr = 0x??;
+//ceiling i2c设备节点
+constexpr const char* ceilingI2cDevPath = "/dev/i2c9";
+//constexpr const uint32_t ceilingI2cAddr = 0x??;
+
+ //pps通信节点
+constexpr const char* pps_screen_ceiling = "/pps/screen_mcu/panel2-1/info";
+constexpr const char* pps_screen_cluster = "/pps/screen_mcu/panel2-0/info";
+constexpr const char* pps_screen_ivi = "/pps/screen_mcu/panel0-0/info";
+
+//dev设备节点
+constexpr  const char* dev_screen_ceiling = "/dev/screen_mcu/panel2-1/info";
+constexpr  const char* dev_screen_cluster = "/dev/screen_mcu/panel2-0/info";
+constexpr  const char* dev_screen_ivi = "/dev/screen_mcu/panel0-0/info";
+
+//lcd 命令
+constexpr const char*  lcdcommandSver = "lcdgetsuppliersver";
+constexpr const char*  lcdcommandHver = "lcdgetsupplierhver";
+constexpr const char*  lcdcommandBlver = "lcdgetsupplierblver";
+constexpr const char*  lcdcommandTpver = "lcdgetsuppliertpver";
+constexpr const char*  lcdcommandBin = "lcdupdate-p";
+constexpr const char*  lcdcommandTpbin = "lcdupdatetp-p";
+
+constexpr const uint8_t bufSize = 128;
+constexpr const uint8_t pollTimeout = 100;
+constexpr const uint8_t pN = 20;
+constexpr const uint8_t binPNIndex = 12;
+constexpr const uint8_t pNDataStart = 3;
+constexpr const uint8_t pNDataLength = 20;
+constexpr const uint8_t devPollFdNum = 3;
+
+constexpr  const char* lcdUpdateCommandPrefix = "lcdupdate";
+
+UpgradeProcess::UpgradeProcess()
+{
+    queueThread_ = std::thread(&UpgradeProcess::pollQueueLcdcommand, this);
+
+}
+
+UpgradeProcess::~UpgradeProcess()
+{
+    if(subscribeThread_.joinable()){
+        subscribeThread_.join();
+    }
+}
+
+int UpgradeProcess::upgrade()
+{    
+    const std::string i2cDevice = iviI2cDevPath;
+    int i2cFd = -1;
+    uint32_t i2cAddr = iviI2cAddr;
+
+    i2cDriverInfo I2CInfo = {
+        .i2cDevPath = i2cDevice, 
+        .i2cFd = i2cFd, 
+        .i2cDevAddr = i2cAddr
+    };
+     
+    I2CInfo.i2cFd = i2cProcessHandler::i2cInitHandler(I2CInfo.i2cDevPath);
+    if (-1 == I2CInfo.i2cFd)
+    { 
+        LOG_D("%s %si2cInit failed", LOG_TAG,__func__);
+        std::cout<<"i2cInit failed"<<std::endl;
+        return -1;
+    }
+    lcdGetSver(I2CInfo);
+    lcdGetHver(I2CInfo);
+    lcdGetBlver(I2CInfo);
+    lcdGetTpver(I2CInfo);
+    lcdUpdatePBin(I2CInfo);
+    lcdUpdateTPBin(I2CInfo);
+    initDevFd();
+
+    //step1
+    //主机通过(0x40 0x22 0xFEF3)通知读取显示屏的I2C通信协议版本
+    upgradeStep1();
+    //step2
+    //查询display的PN
+    bool isStep2UpgradeSuccess = upgradeStep2();
+    if(!isStep2UpgradeSuccess){
+        return -1;
+    }
+    upgradeStep3();
+
+    //deinit
+    i2cProcessHandler::i2cDeinitHandler(I2CInfo.i2cFd);
+
+}
+//Transfer Data 
+int UpgradeProcess::upgradeStep6()
+{
+    
+}
+//Request Download 
+int UpgradeProcess::upgradeStep5()
+{
+    uint8_t requestDownloadReqParam[] = {0x60,0x60,0x00,0x00};//后面的参数待和安波福确认
+    uint8_t requestDownloadRespData[4]={0x0};
+    retry_write:
+    if(i2cProcessHandler::i2cWriteHandler(I2CInfo,requestDownloadReqParam,sizeof(requestDownloadReqParam)/sizeof(uint8_t))) {
+        LOG_D("i2cWrite i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr);
+    } else {
+        LOG_E("主机通过 [0x60 0x60] 通知 display 开始下载失败\n");
+        return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    retry_read:
+    if(i2cProcessHandler::i2cReadHandler(I2CInfo,0x61,sizeof(uint8_t),requestDownloadRespData,sizeof(requestDownloadRespData)/sizeof(uint8_t))) {
+        if(requestDownloadRespDate[1]==0x00){//OK
+            LOG_D("主机通过 [0x60 0x60] 通知 display 开始下载成功\n");
+        } else if(requestDownloadRespDate[1]==0x02){//BUSY 
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            goto retry_read;
+        } else if(requestDownloadRespDate[1]==0x03){ //RETRANSMISSION
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            goto retry_write;
+        }
+    }
+    return 0;
+}
+
+//Erase Range Command (0x60, 0x81)
+int UpgradeProcess::upgradeStep4()
+{
+    uint8_t  eraseRangeReqParam[] = {0x60,0x81,0x00};
+    uint8_t  eraseRangeRespDate[4]={0x0};
+    //MCU地址 0x0000 touch地址 0x8000 tcon地址 0x10000
+    retry_write:
+    if (i2cProcessHandler::i2cWriteHandler(I2CInfo,eraseRangeReqParam,sizeof(eraseRangeReqParam)/sizeof(uint8_t))) {
+        LOG_D("i2cWrite i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr);
+        return -1;
+    } else {
+        LOG_E("主机通过 [0x60 0x81] 通知display擦除指定范围失败\n");
+        return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    retry_read:
+    if(i2cProcessHandler::i2cReadHandler(I2CInfo,0x61,sizeof(uint8_t),eraseRangeRespDate,sizeof(eraseRangeRespDate)/sizeof(uint8_t))) {
+        if(eraseRangeRespDate[1]==0x00){
+
+        } else if(eraseRangeRespDate[1]==0x00){//OK
+            
+        } else if(eraseRangeRespDate[1]==0x02){//BUSY 
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            goto retry_read;
+
+        } else if(eraseRangeRespDate[1]==0x03){ //RETRANSMISSION
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            goto retry_write;
+        }
+    }
+    return 0;
+}
+ //step3
+ //主机发Read Session(0x40 0x22 0xFEF7)给 display，读取当前session
+int UpgradeProcess::upgradeStep3()
+{
+   
+    uint8_t sessionReqParam[] = {0x40,0x22,0xFE,0xF7}; 
+    uint8_t sessionRespData[4]={0x0};
+    if (i2cProcessHandler::i2cWriteHandler(I2CInfo,upgradeReqParam,sizeof(upgradeReqParam)/sizeof(uint8_t))) {
+        LOG_D("i2cWrite i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr);
+    } else {
+        LOG_E("主机通过 [0x40 0x22 0xFEF7] 通知 display 读取当前session失败\n");
+        return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (i2cProcessHandler::i2cReadHandler(I2CInfo,0x41,sizeof(uint8_t),sessionRespData,sizeof(sessionRespData)/sizeof(uint8_t))) {
+        LOG_D("i2c read succeeded,sessionRespData[0]=%#x,sessionRespData[1]=%#x\n",sessionRespData[0],sessionRespData[1]);
+        if(sessionRespData[3] == 0x01) {
+        //当前在APP模式
+        //主机通过Programming Session(0x40 0x10) 命令通知对应的display切到bootloader 刷机模式
+            uint8_t progSessionParam[] = {0x40,0x10};
+            uint8_t progSessionRespData[3]={0x0};
+            if (i2cProcessHandler::i2cWriteHandler(I2CInfo,progSessionParam,sizeof(progSessionParam)/sizeof(uint8_t))) {
+                LOG_D("i2cWrite i2caddr:%2x  succeeded\n",I2CInfo.i2cDevAddr);
+            } else {
+                LOG_E("主机通过Programming Session(0x40 0x10) 命令通知对应的display切到bootloader 刷机模式失败\n");
+                return -1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            if (i2cProcessHandler::i2cReadHandler(I2CInfo,0x41,sizeof(uint8_t),progSessionRespData,sizeof(progSessionRespData)/sizeof(uint8_t))) {
+            LOG_D("i2c read succeeded,progSessionRespData[0]=%#x,progSessionRespData[1]=%#x\n",progSessionRespData[0],progSessionRespData[1]);
+                if(progSessionRespData[0]==0x7F){
+                    LOG_E("主机通过Programming Session [0x40 0x10] 读取display 回复0x7F,失败\n");
+                    ::write(curOpenFd_, "主机通过Programming Session[0x40 0x10] 读取display 回复0x7F,失败\n", bufsize);
+                }
+
+            } else {
+                LOG_E("主机通过Programming Session(0x40 0x10) 命令通知对应的display切到bootloader 刷机模式失败\n");
+                return -1;
+             }
+
+
+
+        }
+    
+    }
+}
+//step2
+//查询display的PN
+bool UpgradeProcess::upgradeStep2()
+{
+    //step2  
+    //主机发Read PN命令(0x40 0x22 0xFEF5)给 display，请求读取显示屏的零件号
+     uint8_t pnReqParam[] = {0x40,0x22,0xFE,0xF5}; 
+     uint8_t  pnRespData[23]={0x0};
+     if (i2cProcessHandler::i2cWriteHandler(I2CInfo,pnReqParam,sizeof(pnReqParam)/sizeof(uint8_t))) {
+         LOG_D("i2cWrite i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr);
+     } else {
+         LOG_E("主机通过(0x40 0x22 0xFEF5)通知读取显示屏的零件号失败\n");
+     }
+     //50ms后主机通过IIC协议0x41查询display的PN
+     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+     if (i2cProcessHandler::i2cReadHandler(I2CInfo,pnReqParam[0],sizeof(pnReqParam[0]),pnRespData,sizeof(pnRespData)/sizeof(uint8_t))) {
+        LOG_D("i2cread succeeded,readPNData[0]=%#x,readPNData[1]=%#x\n",readPNData[0],readPNData[1]);
+        if(pnRespData[1]==0x7F){
+            LOG_E("用户当前升级屏升级失败\n");
+            ::write(curOpenFd_, "byte[0]-0x7F,upgrade failed\n", bufsize);
+        }else {
+            std::string displayPN{};
+            for (int i = pNDataStart; i < pNDataStart+pNDataLength; i++) {
+                displayPN += static_cast<char>(readPNData[i]);
+            }
+            //主机的bin文件名称
+            std::string hostBinFile = getBinFileFromUpgradeQueue();
+            return decodeBinFile(hostBinFile,displayPN);
+        }
+     }
+}
+ //step1
+//主机通过(0x40 0x22 0xFEF3)通知读取显示屏的I2C通信协议版本
+int UpgradeProcess::upgradeStep1()
+{
+    uint8_t i2cVerReqParam[] = {0x40,0x22,0xFE,0xF3};  
+    uint8_t i2cVerRespData[13] = {0x0};
+     if (i2cProcessHandler::i2cWriteHandler(I2CInfo,i2cVerReqParam,sizeof(i2cVerReqParam)/sizeof(uint8_t))) {
+         LOG_D("i2cWrite i2caddr:%#x regaddr:%#x succeeded\n",I2CInfo.i2cDevAddr,writeNotifyData[0]);
+     } else {
+         LOG_E("主机通过(0x40 0x22 0xFEF3)通知读取显示屏的I2C通信协议版本失败\n");
+         return -1;
+     }
+     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (i2cProcessHandler::i2cReadHandler(I2CInfo,0x41,sizeof(uint8_t),i2cVerRespData,sizeof(i2cVerRespData)/sizeof(uint8_t))) {
+          LOG_D("i2cread succeeded,i2cVerRespData[0]=%#x,i2cVerRespData[1]=%#x\n",i2cVerRespData[0],i2cVerRespData[1]);
+          std::string i2cVersion;
+          for (int i = 3; i < 13; i++) {
+              i2cVersion += static_cast<char>(i2cVerRespData[i]);
+          }
+          LOG_D("I2C协议版本: %s", i2cVersion.c_str());
+    } else {
+          LOG_E("i2cread failed\n");
+          return -1;
+    }
+}
+
+std::string UpgradeProcess::getBinFileFromUpgradeQueue()
+{         
+    std::string lcdUpgradeCommand{};
+    std::unique_lock<std::mutex> lock(upgradeMutex_);
+    upgradeCv_.wait(lock, [this] { return !upgradeQueue_.IsEmpty(); });
+    // 3. 从队列弹出命令（此时队列已非空）
+    upgradeQueue_.Pop(lcdUpgradeCommand);
+    lock.unlock();
+    formatLcdcommand(lcdUpgradeCommand);
+        // ======== 2. 解析 -p 后的 bin 文件完整路径 ========
+    size_t pPos = lcdCommand.find("-p");
+    if (pPos == std::string::npos) {
+        LOG_E("%s 格式错误缺少 -p: %s", cmdType.c_str(), lcdCommandResult.c_str());
+        return "";
+    }
+    std::string binFileStart = lcdUpgradeCommand.substr(pPos + 2);
+    if (binFileStart.empty()) {
+        LOG_E("-p 后路径为空: %s", lcdUpgradeCommand.c_str());
+        return "";
+    }
+}
+
+int UpgradeProcess::lcdGetSver(const  i2cDriverInfo &I2CInfo)
+{
+     //  lcd get supplier sver（软件版本）
+     uint8_t sverReqparam[] = {0x40,0x22,0xFE,0xF0};
+     uint8_t sverRespData[23] = {0x0};
+     std::string sverRespDataStr = "";
+     //i2c write
+     if (i2cProcessHandler::i2cWriteHandler(I2CInfo,sverReqparam,sizeof(sverReqparam)/sizeof(uint8_t))) {
+         LOG_D("i2cWrite i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr,sverReqparam[0]);
+     } else {
+         LOG_E("i2cWrite i2caddr:%2x regaddr:%2x failed\n",I2CInfo.i2cDevAddr,sverReqparam[0]);
+         return -1;
+     }
+     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+     if(i2cProcessHandler::i2cReadHandler(I2CInfo,0x41,sizeof(uint8_t),sverRespData,sizeof(sverRespData)/sizeof(uint8_t))) {
+        LOG_D("i2cRead i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr,0x41);
+        for (int i = 3; i < 23; i++) {
+             //将从3到23 的sver 转换成字符串
+            sverRespDataStr += static_cast<char>(sverRespData[i]);
+        }
+        if (devScreenIviFd_ == -1) {
+            LOG_E("屏幕FD 未初始化，无法缓存命令结果 %s:%d", __FUNCTION__, __LINE__);
+            return -1;
+        }
+        auto it = lcdCommandMap_.find(devScreenIviFd_);
+        if(it==lcdCommandMap_.end()){
+            LOG_E("屏幕 FD 未在 lcdCommandMap_ 中注册 %s:%d", __FUNCTION__, __LINE__);
+            return -1;    
+        }
+        it->second.emplace(lcdCommandSver, sverRespDataStr);
+     } else {
+         LOG_E("i2cRead i2caddr:%2x regaddr:%2x failed\n",I2CInfo.i2cDevAddr,0x41);
+         return -1;
+     }
+    return 0;
+}
+
+int UpgradeProcess::lcdGetHver(const  i2cDriverInfo &I2CInfo)
+{
+     //  lcd get supplier hver（硬件版本）
+     uint8_t hverReqparam[] = {0x40,0x22,0xFE,0xF1};
+     uint8_t hverRespData[23] = {0x0};
+     std::string hverRespDataStr = "";
+     if (i2cProcessHandler::i2cWriteHandler(I2CInfo,sverReqparam,sizeof(sverReqparam)/sizeof(uint8_t))) {
+         LOG_D("i2cWrite i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr,sverReqparam[0]);
+     } else {
+         LOG_E("i2cWrite i2caddr:%2x regaddr:%2x failed\n",I2CInfo.i2cDevAddr,sverReqparam[0]);
+         return -1;
+     }
+     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+     if(i2cProcessHandler::i2cReadHandler(I2CInfo,0x41,sizeof(uint8_t),hverRespData,sizeof(hverRespData)/sizeof(uint8_t))) {
+        LOG_D("i2cRead i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr,0x41);
+        for (int i = 3; i < 23; i++) {
+             //将从3到23 的sver 转换成字符串
+            hverRespDataStr += static_cast<char>(hverRespData[i]);
+        }
+        if (devScreenIviFd_ == -1) {
+            LOG_E("屏幕FD 未初始化，无法缓存命令结果 %s:%d", __FUNCTION__, __LINE__);
+            return -1;
+        }
+        auto it = lcdCommandMap_.find(devScreenIviFd_);
+        if(it==lcdCommandMap_.end()){
+            LOG_E("屏幕 FD 未在 lcdCommandMap_ 中注册 %s:%d", __FUNCTION__, __LINE__);
+            return -1;    
+        }
+        it->second.emplace(lcdCommandHver, hverRespDataStr);
+     } else {
+         LOG_E("i2cRead i2caddr:%2x regaddr:%2x failed\n",I2CInfo.i2cDevAddr,0x41);
+         return -1;
+     }
+    return 0;
+}
+
+int UpgradeProcess::lcdGetBlver(const  i2cDriverInfo &I2CInfo)
+{
+     //  lcd get supplier blver（bootload版本）
+    uint8_t blverReqparam[] = {0x40,0x22,0xFE,0xF2};
+    uint8_t blverRespData[23] = {0x0};
+    std::string blverRespDataStr = "";
+    if (i2cProcessHandler::i2cWriteHandler(I2CInfo,blverReqparam,sizeof(blverReqparam)/sizeof(uint8_t))) {
+        LOG_D("i2cWrite i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr,sverReqparam[0]);
+     } else {
+        LOG_E("i2cWrite i2caddr:%2x regaddr:%2x failed\n",I2CInfo.i2cDevAddr,sverReqparam[0]);
+        return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if(i2cProcessHandler::i2cReadHandler(I2CInfo,0x41,sizeof(uint8_t),blverRespData,sizeof(blverRespData)/sizeof(uint8_t))) {
+        LOG_D("i2cRead i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr,0x41);
+        for (int i = 3; i < 23; i++) {
+             //将从3到23 的sver 转换成字符串
+            blverRespDataStr += static_cast<char>(blverRespData[i]);
+        }
+        if (devScreenIviFd_ == -1) {
+            LOG_E("屏幕FD 未初始化，无法缓存命令结果 %s:%d", __FUNCTION__, __LINE__);
+            return -1;
+        }
+        auto it = lcdCommandMap_.find(devScreenIviFd_);
+        if(it==lcdCommandMap_.end()){
+            LOG_E("屏幕 FD 未在 lcdCommandMap_ 中注册 %s:%d", __FUNCTION__, __LINE__);
+            return -1;    
+        }
+        it->second.emplace(lcdCommandBlver, blverRespDataStr);
+     } else {
+        LOG_E("i2cRead i2caddr:%2x regaddr:%2x failed\n",I2CInfo.i2cDevAddr,0x41);
+        return -1;
+    }
+    return 0;
+}
+
+int UpgradeProcess::lcdGetTpver(const  i2cDriverInfo &I2CInfo) {
+     //  lcd get supplier tp（tp版本）
+    uint8_t tpverReqparam[] = {0x40,0x22,0xFE,0xFB};
+    uint8_t tpverRespData[13] = {0x0};
+    std::string tpverRespDataStr = "";
+    if (i2cProcessHandler::i2cWriteHandler(I2CInfo,tpverReqparam,sizeof(tpverReqparam)/sizeof(uint8_t))) {
+        LOG_D("i2cWrite i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr,tpverReqparam[0]);
+    } else {
+        LOG_E("i2cWrite i2caddr:%2x regaddr:%2x failed\n",I2CInfo.i2cDevAddr,tpverReqparam[0]);
+        return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if(i2cProcessHandler::i2cReadHandler(I2CInfo,0x41,sizeof(uint8_t),tpverRespData,sizeof(tpverRespData)/sizeof(uint8_t))) {
+        LOG_D("i2cRead i2caddr:%2x regaddr:%2x succeeded\n",I2CInfo.i2cDevAddr,0x41);
+        for (int i = 3; i < 13; i++) {
+             //将从3到13 的sver 转换成字符串
+            tpverRespDataStr += static_cast<char>(tpverRespData[i]);
+        }
+        if (devScreenIviFd_ == -1) {
+            LOG_E("屏幕FD 未初始化，无法缓存命令结果 %s:%d", __FUNCTION__, __LINE__);
+            return -1;
+        }
+        auto it = lcdCommandMap_.find(devScreenIviFd_);
+        if(it==lcdCommandMap_.end()){
+            LOG_E("屏幕 FD 未在 lcdCommandMap_ 中注册 %s:%d", __FUNCTION__, __LINE__);
+            return -1;    
+        }
+        it->second.emplace(lcdCommandTpver, tpverRespDataStr);
+    } else {
+        LOG_E("i2cRead i2caddr:%2x regaddr:%2x failed\n",I2CInfo.i2cDevAddr,0x41);
+        return -1;
+    }
+    return 0;
+
+}
+bool UpgradeProcess::decodeBinFile(const std::string &binFile, std::string &binFilePN)
+{
+    std::ifstream file(binFile, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "无法打开文件: " << binFile << std::endl;
+        LOG_D("无法打开bin文件: %s", binFile.c_str());
+        return false;
+    }
+    // 跳过起始段(4) + CRC校验段(4) + 包头长度(4) = 12字节
+    file.seekg(binPNIndex, std::ios::beg);
+    if (!file) {
+        std::cerr << "文件太小或读取失败" << std::endl;
+        LOG_D("文件太小或读取失败: %s", binFile.c_str());
+        return false;
+    }
+    // 读取20字节的产品零件号
+    std::string pNDataBuffer(pNDataLength,'\0');
+    file.read(&pNDataBuffer[0], pNDataLength);
+    return binFilePN == pNDataBuffer;
+}
+void UpgradeProcess::formatLcdcommand(std::string& command)
+{
+    command.erase(std::remove(command.begin(), command.end(), ' '), command.end());
+}
+int UpgradeProcess::initScreenDevFd()
+{
+    //初始化和卢旭东 交互的 通信枢纽节点，订阅发布 dev设备节点
+    devScreenClusterFd_ = ::open(dev_screen_cluster, O_RDWR | O_CREAT, S_IRWXU | S_IRWXG | S_IRWXO );
+    devScreenIviFd_ = ::open(dev_screen_ivi, O_RDWR | O_CREAT, S_IRWXU | S_IRWXG | S_IRWXO );
+    devScreenCeilingFd_ = ::open(dev_screen_ceiling, O_RDWR | O_CREAT, S_IRWXU | S_IRWXG | S_IRWXO );
+    if(devScreenClusterFd_ < 0 || devScreenIviFd_ < 0 || devScreenCeilingFd_ < 0 ) {
+        LOG_E("open dev_screen_cluster or dev_screen_ivi or dev_screen_ceiling failed\n");
+        if (devScreenClusterFd_ >= 0) ::close(devScreenClusterFd_);
+        if (devScreenIviFd_ >= 0) ::close(devScreenIviFd_);
+        if (devScreenCeilingFd_ >= 0) ::close(devScreenCeilingFd_);
+        return -1;
+    }
+    //更新FD到屏幕类型的映射
+    fdToScreenType_.clear();
+    fdToScreenType_[devScreenClusterFd_] = ScreenType::Cluster;
+    fdToScreenType_[devScreenIviFd_] = ScreenType::Ivi;
+    fdToScreenType_[devScreenCeilingFd_] = ScreenType::Ceiling;
+    pollScreenDevFd();         
+}
+
+
+int UpgradeProcess::pollScreenDevFd()
+{
+    //struct pollfd  监听devScreenClusterFd,devScreenIviFd,devScreenCeilingFd
+    struct pollfd readfds[devPollFdNum]{0};
+    readfds[0].fd = devScreenClusterFd_;
+    readfds[0].events = POLLIN;
+    readfds[1].fd = devScreenIviFd_;
+    readfds[1].events = POLLIN;
+    readfds[2].fd = devScreenCeilingFd_;
+    readfds[2].events = POLLIN;
+    while(true) {
+        int ret = ::poll(readfds, devPollFdNum, pollTimeout);
+        if(ret==-1) {
+            perror("poll devScreenClusterFd,devScreenIviFd,devScreenCeilingFd error");
+            ::close(devScreenClusterFd_);
+            ::close(devScreenIviFd_);
+            ::close(devScreenCeilingFd_);
+            devScreenClusterFd_ = -1;
+            devScreenIviFd_ = -1;
+            devScreenCeilingFd_ = -1;
+            break;
+        } else if (ret == 0) {
+            continue;;
+          } else { 
+                char buf[bufSize] = {0};
+                for (int i = 0; i < devPollFdNum; ++i) {
+                    if (readfds[i].revents & POLLIN) {
+                        if(i==0){
+                            readClusterFd(devScreenClusterFd_,buf,bufSize);
+                        }else if(i==1){
+                            readIviFd(devScreenIviFd_,buf,bufSize);
+                        }else if(i==2){
+                            readCeilingFd(devScreenCeilingFd_,buf,bufSize);
+                        }
+                        memset(buf, 0, bufSize);  // 清空缓冲区，避免残留数据 
+                   }
+                }   
+            }        
+    }
+}
+
+int UpgradeProcess::readClusterFd(int fd,char *buf,int len)
+{
+    LOG_D("devScreenClusterFd has data, reading...");
+    int clusterRead = ::read(fd, buf, len);
+    LOG_D("Read from devScreenClusterFd: %.*s", clusterRead, buf);
+    if (clusterRead > 0) {
+            // 使用std::find_if查找首个匹配的命令前缀
+        std::string clusterData(buf, clusterRead);
+        formatLcdcommand(clusterData);
+        bool isCommandMatched = false;  
+        auto it = std::find_if(lcdCommandList_.begin(), lcdCommandList_.end(),
+            [&clusterData](const std::string& cmd) {
+                
+                return clusterData.size() >= cmd.size() &&  
+                    clusterData.compare(0, cmd.size(), cmd) == 0;  // 前缀比较
+            });
+        isCommandMatched = (it != lcdCommandList_.end());  // 找到则标记匹配
+        if(isCommandMatched){
+            bool isUpdateCommand =  bool isUpgradeCmd = (clusterData.substr(0, strlen(lcdcommandBin)) == lcdcommandBin) || 
+                               (clusterData.substr(0, strlen(lcdcommandTpbin)) == lcdcommandTpbin);
+            if(isUpdateCommand){
+                std::lock_guard<std::mutex> lock(upgradeMutex_);
+                upgradeQueue_.Push(ScreenCommand{ScreenType::Cluster, clusterData});
+                upgradeCv_.notify_one();
+            } else {
+                safeQueue_.Push(ScreenCommand{ScreenType::Cluster, clusterData});
+            }
+        }
+    } else if (clusterRead == -1) {
+        ::close(devScreenClusterFd_);
+        devScreenClusterFd_ = -1;
+        perror("read devScreenClusterFd failed");
+      } else if(clusterRead == 0) {
+        //continue;
+        // ::close(devScreenClusterFd_);
+        // devScreenClusterFd_ = -1;
+      }     
+}
+
+int UpgradeProcess::readIviFd(int fd,char *buf,int len)
+{
+    LOG_D("devScreenIviFd has data, reading...");
+    int iviRead = ::read(fd, buf, len);
+    if (iviRead > 0) {
+        std::string iviData(buf, iviRead);
+        formatLcdcommand(iviData);
+        bool isCommandMatched = false;  
+        auto IIter = std::find_if(lcdCommandList_.begin(), lcdCommandList_.end(),
+            [&iviData](const std::string& cmd) {
+                return iviData.size() >= cmd.size() &&  
+                    iviData.compare(0, cmd.size(), cmd) == 0;
+            });
+        isCommandMatched = (IIter != lcdCommandList_.end());
+        if(isCommandMatched){
+            bool isUpgradeCmd = (iviData.substr(0, strlen(lcdcommandBin)) == lcdcommandBin) || 
+                               (iviData.substr(0, strlen(lcdcommandTpbin)) == lcdcommandTpbin);
+            if(isUpgradeCmd){
+                std::lock_guard<std::mutex> lock(upgradeMutex_);
+                upgradeQueue_.Push(ScreenCommand{ScreenType::Ivi, iviData});
+                upgradeCv_.notify_one();
+            } else {
+                safeQueue_.Push(ScreenCommand{ScreenType::Ivi, iviData});
+            }
+        } 
+    } else if (iviRead == -1) {
+        ::close(devScreenIviFd_);
+        devScreenIviFd_ = -1;
+        perror("read devScreenIviFd failed");
+       } else if(clusterRead == 0) {
+        //continue;
+        // ::close(devScreenClusterFd_);
+        // devScreenClusterFd_ = -1;
+        }                                       
+}
+int UpgradeProcess::readCeilingFd(int fd,char *buf,int len)
+{
+    int ceilingRead = ::read(fd, buf, len);
+    if (ceilingRead > 0) {
+        std::string ceilingData(buf, ceilingRead);
+        formatLcdcommand(ceilingData);
+        bool isCommandMatched = false;  
+        auto CIter = std::find_if(lcdCommandList_.begin(), lcdCommandList_.end(),
+            [&ceilingData](const std::string& cmd) {
+                return ceilingData.size() >= cmd.size() &&  
+                    ceilingData.compare(0, cmd.size(), cmd) == 0;
+            });
+        isCommandMatched = (CIter != lcdCommandList_.end());
+        if(isCommandMatched){
+            bool isUpdateCommand =  bool isUpgradeCmd = (clusterData.substr(0, strlen(lcdcommandBin)) == lcdcommandBin) || 
+                               (clusterData.substr(0, strlen(lcdcommandTpbin)) == lcdcommandTpbin);
+            if(isUpdateCommand){
+                std::lock_guard<std::mutex> lock(upgradeMutex_);
+                upgradeQueue_.Push(ScreenCommand{ScreenType::Ceiling, clusterData});
+                upgradeCv_.notify_one();
+            } else {
+                safeQueue_.Push(ScreenCommand{ScreenType::Ceiling, clusterData});
+            }
+        }
+    } else if (ceilingRead == -1) {
+        ::close(devScreenCeilingFd_);
+        devScreenCeilingFd_ = -1;
+        perror("read devScreenCeilingFd failed");
+      } else if(clusterRead == 0) {
+        //continue;
+        // ::close(devScreenClusterFd_);
+        // devScreenClusterFd_ = -1;
+      }
+}
+int UpgradeProcess::pollQueueLcdcommand()
+{
+    while(true) {
+        //std::unique_lock<std::mutex> lock(safeQueueMtx_);
+        //safeQueueCv_.wait(lock, [this] { return !safeQueue_.Empty(); });
+        ScreenCommand cmd{};
+        if(!safeQueue_.Pop(cmd)){
+            continue;
+        }
+        
+        formatLcdcommand(cmd.command);
+        //lock.unlock();
+        if(cmd.screenType == ScreenType::Cluster) {
+            curOpenScreenFd_ = devScreenClusterFd_;
+        } else if(cmd.screenType == ScreenType::Ivi) {
+            curOpenScreenFd_ = devScreenIviFd_;
+        } else if(cmd.screenType == ScreenType::Ceiling) {
+            curOpenScreenFd_ = devScreenCeilingFd_;
+        }
+        if(curOpenScreenFd_ == -1){
+            LOG_E("无效的屏幕类型或未初始化FD, %s %d",__func__,__LINE__);
+            continue;
+        }
+        auto outerIt = lcdCommandMap_.find(curOpenScreenFd_);
+        if(outerIt == lcdCommandMap_.end()){
+            LOG_E("屏幕FD[%d]未在lcdCommandMap_中找到映射 %s %d",curOpenScreenFd_,__func__,__LINE__);
+            continue;
+        }
+        std::map<std::string ,std::string>& innerMap = outerIt->second;
+        auto innerIt = innerMap.find(cmd.command);
+        if(innerIt != innerMap.end()){
+            std::string lcdCommandResp = innerIt->second;
+            LOG_D("屏幕类型[%d]命令[%s]结果: %s", cmd.screenType, cmd.command.c_str(), lcdCommandResp.c_str());
+            ssize_t writeRet = ::write(curOpenScreenFd_, lcdCommandResp.c_str(), lcdCommandResp.size());
+            if(writeRet == -1) {
+                LOG_E("写入屏幕FD[%d]失败: %s, %s,%d", curOpenScreenFd_, strerror(errno), __func__, __LINE__);
+            } else if( writeRet!=static_cast<ssize_t>(lcdCommandResp.size())){
+                LOG_E("写入屏幕FD[%d]失败: 写入字节数[%ld]与预期字节数[%ld]不一致, %s,%d", curOpenScreenFd_, writeRet, lcdCommandResp.size(), __FUNCTION__, __LINE__);
+            } else {
+                LOG_D("成功写入屏幕FD[%d] %ld字节数据", curOpenScreenFd_, writeRet);
+            }
+        }else {
+            LOG_E("屏幕FD[%d]命令[%s]未在lcdCommandMap_中找到映射 %s,%d",curOpenScreenFd_,cmd.command.c_str(),__func__,__LINE__);
+        }
+    }
+}
+
