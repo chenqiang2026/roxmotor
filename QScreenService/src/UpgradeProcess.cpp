@@ -1,4 +1,4 @@
-#include "UpgradeProcess.h"
+#include "../inc/UpgradeProcess.h"
 #include <cstdint>
 #include <cstdio>
 #include <sys/stat.h>
@@ -7,7 +7,9 @@
 #include <sys/poll.h>
 #include <unistd.h> 
 #include <cstring>
-#include "CRC16XMODEM.h"
+#include <iostream>
+#include "../inc/CRC16XMODEM.h"
+#include "../inc/BinFileDecode.h"
 
 using namespace std;
 struct i2cDriverInfo;
@@ -29,14 +31,12 @@ UpgradeProcess::UpgradeProcess()
    // queueThread_ = std::thread(&UpgradeProcess::pollQueueLcdcommand, this);
 
 }
-
 UpgradeProcess::~UpgradeProcess()
 {
     // if(subscribeThread_.joinable()){
     //     subscribeThread_.join();
     // }
 }
-
 int UpgradeProcess::upgrade()
 {    
     const std::string i2cDevice = iviI2cDevPath;
@@ -53,17 +53,10 @@ int UpgradeProcess::upgrade()
     if (-1 == I2CInfo.i2cFd)
     { 
         LOG_D("%s %si2cInit failed", LOG_TAG,__func__);
-        std::cout<<"i2cInit failed"<<std::endl;
+        std::cout <<"i2cInit failed"<< std::endl;
         return -1;
     }
-    //lcdGetSver(I2CInfo);
-    //lcdGetHver(I2CInfo);
-    //lcdGetBlver(I2CInfo);
-    //lcdGetTpver(I2CInfo);
-    //lcdUpdatePBin(I2CInfo);
-    //lcdUpdateTPBin(I2CInfo);
-    //initDevFd();
-
+    
     //step1
     //主机通过(0x40 0x22 0xFEF3)通知读取显示屏的I2C通信协议版本
     upgradeStep1();
@@ -119,7 +112,6 @@ int UpgradeProcess::upgradeStep5()
     }
     return 0;
 }
-
 //Erase Range Command (0x60, 0x81)
 int UpgradeProcess::upgradeStep4()
 { 
