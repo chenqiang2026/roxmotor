@@ -20,8 +20,51 @@
 
 
 static std::atomic<bool> g_running{true};
+ bool restartPpsService() 
+ {
+    std::cout << "==== Restarting PPS Service ====" << std::endl;
+    //检查PPS服务是否正在运行
+    int checkResult = system("pidin | grep -q '[p]ps'");
+    if(WEXITSTATUS(checkResult) == 0) {
+        std::cout << "PPS service is running, try to slay it" << std::endl;
+        system("slay -f pps 2>/dev/null");
+         (void)sleep(1);
+    }
+    // 清理旧的PPS目录
+    struct stat st;
+    if (stat("/tmp/pps", &st) == 0) {
+        std::cout << "Removing existing /tmp/pps directory" << std::endl;
+        if (system("rm -rf /tmp/pps") != 0) {
+            std::cerr << "Failed to remove /tmp/pps directory" << std::endl;
+            return false;
+        }
+    }
+    //重启PPS服务
+    int startResult = system("pps -m /tmp/pps -A /mnt/etc/pps_acl.conf -p /var/pps_persist -t 100");
+    if (WEXITSTATUS(startResult) == 0) {
+        std::cout << "PPS restarted successfully" << std::endl;
+    } else {
+        std::cerr << "Failed to restart PPS" << std::endl;
+        return false;
+    }
+    //等待PPS服务完全启动
+    (void)sleep(2);
+    //检查PPS目录是否创建成功
+    if (stat("/tmp/pps", &st) != 0) {
+        if (errno == ENOENT) {
+            std::cout << "PPS server isn't running." << std::endl;
+            return false;
+        } else {
+            std::cerr << "stat (/tmp/pps) failed: " << std::strerror(errno) << std::endl;
+            return false;
+        }
+    }
+    std::cout << "==== PPS Service Restart Completed ====" << std::endl;
+    return true;
+}
+
 static int openScreenDev(const std::string path) {
-    int fd = ::open(path.c_str(), O_RDWR|O_NONBLOCK);
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT, S_IRWXU | S_IRWXG | S_IRWXO );
     if(fd < 0) {
         std::cerr << "open ("<< path <<") failed" << std::strerror(errno)<< std::endl;
         return -1;
@@ -34,21 +77,8 @@ void sigint_handler(int) {
 int main(int argc,char* argv[])
 {
     std::signal(SIGINT, sigint_handler);
-    int checkResult = system("pidin | grep -q '[p]ps'");
-    if(WEXITSTATUS(checkResult) == 0) {
-        std::cout << "PPS service is running, try to slay it" << std::endl;
-        system("slay -f pps 2>/dev/null");
-    } 
-    int startResult = system("pps");
-
-    if (WEXITSTATUS(startResult) == 0) {
-        std::cout << "PPS restarted successfully" << std::endl;
-    } else {
-        std::cerr << "Failed to restart PPS" << std::endl;
-        return -1;
-    }
-    struct stat st;
-    if (stat("/pps", &st) != 0) {
+    if (!restartPpsService()) {
+        std::cerr << "Failed to restart PPS service. Exiting." << std::endl;
         return -1;
     }
     static int clusterFd = -1,iviFd = -1,ceilingFd = -1;
@@ -84,11 +114,12 @@ int main(int argc,char* argv[])
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     std::cout << "Shutting down...\n";
+    
+    poller.stop();
+    normalExecutor->stop();
     delete dispatcher;
     delete controller;
     delete normalExecutor;
-    poller.stop();
-    normalExecutor->stop();
     //upgradeExecutor->stop();
 
     // close device fds
